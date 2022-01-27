@@ -4,10 +4,14 @@ This is an in console text editor.
 __This is a work in progress project__
 
 ## How to run the app?
-To build and run in release mode execute:
+To open a file raw mode, execute the followin command:
 
 ```
-cargo run --release
+cargo run <file_name>
+```
+You can use this command to open the test file __dummy.txt__
+```
+cargo run dummy.txt
 ```
 
 To exit of the app press
