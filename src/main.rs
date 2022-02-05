@@ -1,13 +1,14 @@
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::ClearType;
 use crossterm::{cursor, event, execute, queue, style, terminal};
-use std::io::{stdout, Write};
+use std::io::{stdout, ErrorKind, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use std::{cmp, env, fs, io};
 
 const VERSION: &str = "0.0.1";
 const TAB_STOP: usize = 8;
+const QUIT_TIMES: u8 = 3;
 
 struct CleanUp;
 impl Drop for CleanUp {
@@ -23,18 +24,20 @@ struct Output {
     cursor_controller: CursorController,
     editor_rows: EditorRows,
     status_message: StatusMessage,
+    dirty: u64,
 }
 impl Output {
     fn new() -> Self {
         let win_size = terminal::size()
-            .map(|(x, y)| (x as usize, y as usize - 1))
+            .map(|(x, y)| (x as usize, y as usize - 2))
             .unwrap();
         Self {
             win_size,
             editor_contents: EditorContents::new(),
             cursor_controller: CursorController::new(win_size),
             editor_rows: EditorRows::new(),
-            status_message: StatusMessage::new("HELP: Ctrl-Q = Quit".into()),
+            status_message: StatusMessage::new("HELP: Ctrl-S = Save | Ctrl-Q = Quit".into()),
+            dirty: 0,
         }
     }
 
@@ -121,13 +124,14 @@ impl Output {
             .push_str(&style::Attribute::Reverse.to_string());
 
         let info = format!(
-            "{} -- {} lines",
+            "{} {} -- {} lines",
             self.editor_rows
                 .filename
                 .as_ref()
                 .and_then(|path| path.file_name())
                 .and_then(|name| name.to_str())
                 .unwrap_or("[No name]"),
+            if self.dirty > 0 { "(modified)" } else { "" },
             self.editor_rows.number_of_rows()
         );
         let info_len = cmp::min(info.len(), self.win_size.0);
@@ -150,6 +154,66 @@ impl Output {
         self.editor_contents
             .push_str(&style::Attribute::Reset.to_string());
         self.editor_contents.push_str("\r\n");
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        if self.cursor_controller.cursor_y == self.editor_rows.number_of_rows() {
+            self.editor_rows
+                .insert_row(self.editor_rows.number_of_rows(), String::new());
+            self.dirty += 1;
+        }
+
+        self.editor_rows
+            .get_editor_row_mut(self.cursor_controller.cursor_y)
+            .inser_char(self.cursor_controller.cursor_x, ch);
+        self.cursor_controller.cursor_x += 1;
+        self.dirty += 1;
+    }
+
+    fn delete_char(&mut self) {
+        if self.cursor_controller.cursor_y == self.editor_rows.number_of_rows() {
+            return;
+        }
+
+        let row = self
+            .editor_rows
+            .get_editor_row_mut(self.cursor_controller.cursor_y);
+
+        if self.cursor_controller.cursor_x > 0 {
+            row.delete_char(self.cursor_controller.cursor_x - 1);
+            self.cursor_controller.cursor_x -= 1;
+        } else {
+            let previous_row_content = self
+                .editor_rows
+                .get_row(self.cursor_controller.cursor_y - 1);
+            self.cursor_controller.cursor_x = previous_row_content.len();
+            self.editor_rows
+                .join_adjacent_rows(self.cursor_controller.cursor_y);
+            self.cursor_controller.cursor_y -= 1;
+        }
+
+        self.dirty += 1;
+    }
+
+    fn insert_newline(&mut self) {
+        if self.cursor_controller.cursor_x == 0 {
+            self.editor_rows
+                .insert_row(self.cursor_controller.cursor_y, String::new())
+        } else {
+            let current_row = self
+                .editor_rows
+                .get_editor_row_mut(self.cursor_controller.cursor_y);
+            let new_row_content = current_row.row_content[self.cursor_controller.cursor_x..].into();
+            current_row
+                .row_content
+                .truncate(self.cursor_controller.cursor_x);
+            EditorRows::render_row(current_row);
+            self.editor_rows
+                .insert_row(self.cursor_controller.cursor_y + 1, new_row_content);
+        }
+        self.cursor_controller.cursor_x = 0;
+        self.cursor_controller.cursor_y += 1;
+        self.dirty += 1;
     }
 }
 
@@ -207,6 +271,7 @@ impl io::Write for EditorContents {
 struct Editor {
     reader: Reader,
     output: Output,
+    quit_times: u8,
 }
 
 impl Editor {
@@ -214,6 +279,7 @@ impl Editor {
         Self {
             reader: Reader,
             output: Output::new(),
+            quit_times: QUIT_TIMES,
         }
     }
 
@@ -222,7 +288,17 @@ impl Editor {
             KeyEvent {
                 code: KeyCode::Char('q'),
                 modifiers: event::KeyModifiers::CONTROL,
-            } => return Ok(false),
+            } => {
+                if self.output.dirty > 0 && self.quit_times > 0 {
+                    self.output.status_message.set_message(format!(
+                        "WARNING!! File has unsaved changes. Pres Ctrl-Q {} mote times to quit.",
+                        self.quit_times
+                    ));
+                    self.quit_times -= 1;
+                    return Ok(true);
+                }
+                return Ok(false);
+            }
             KeyEvent {
                 code:
                     direction
@@ -256,6 +332,36 @@ impl Editor {
                     });
                 })
             }
+            KeyEvent {
+                code: KeyCode::Char('s'),
+                modifiers: KeyModifiers::CONTROL,
+            } => self.output.editor_rows.save().map(|len| {
+                self.output
+                    .status_message
+                    .set_message(format!("{} bytes written to disk", len));
+                self.output.dirty = 0
+            })?,
+            KeyEvent {
+                code: key @ (KeyCode::Backspace | KeyCode::Delete),
+                modifiers: KeyModifiers::NONE,
+            } => {
+                if matches!(key, KeyCode::Delete) {
+                    self.output.move_cursor(KeyCode::Right)
+                }
+                self.output.delete_char()
+            }
+            KeyEvent {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::NONE,
+            } => self.output.insert_newline(),
+            KeyEvent {
+                code: code @ (KeyCode::Char(..) | KeyCode::Tab),
+                modifiers: KeyModifiers::NONE | KeyModifiers::SHIFT,
+            } => self.output.insert_char(match code {
+                KeyCode::Tab => '\t',
+                KeyCode::Char(ch) => ch,
+                _ => unreachable!(),
+            }),
             _ => {}
         }
         Ok(true)
@@ -368,17 +474,28 @@ impl CursorController {
     }
 }
 
+#[derive(Default)]
 struct Row {
-    row_content: Box<str>,
+    row_content: String,
     render: String,
 }
 
 impl Row {
-    fn new(row_content: Box<str>, render: String) -> Self {
+    fn new(row_content: String, render: String) -> Self {
         Self {
             row_content,
             render,
         }
+    }
+
+    fn inser_char(&mut self, at: usize, ch: char) {
+        self.row_content.insert(at, ch);
+        EditorRows::render_row(self)
+    }
+
+    fn delete_char(&mut self, at: usize) {
+        self.row_content.remove(at);
+        EditorRows::render_row(self)
     }
 }
 
@@ -448,6 +565,41 @@ impl EditorRows {
 
     fn get_row(&self, at: usize) -> &str {
         &self.row_contents[at].row_content
+    }
+
+    fn get_editor_row_mut(&mut self, at: usize) -> &mut Row {
+        &mut self.row_contents[at]
+    }
+
+    fn save(&self) -> io::Result<usize> {
+        match &self.filename {
+            None => Err(io::Error::new(ErrorKind::Other, "no file name specified")),
+            Some(name) => {
+                let mut file = fs::OpenOptions::new().write(true).create(true).open(name)?;
+                let contents: String = self
+                    .row_contents
+                    .iter()
+                    .map(|it| it.row_content.as_str())
+                    .collect::<Vec<&str>>()
+                    .join("\n");
+                file.set_len(contents.len() as u64)?;
+                file.write_all(contents.as_bytes())?;
+                Ok(contents.as_bytes().len())
+            }
+        }
+    }
+
+    fn join_adjacent_rows(&mut self, at: usize) {
+        let current_row = self.row_contents.remove(at);
+        let previous_row = self.get_editor_row_mut(at - 1);
+        previous_row.row_content.push_str(&current_row.row_content);
+        Self::render_row(previous_row);
+    }
+
+    fn insert_row(&mut self, at: usize, contents: String) {
+        let mut new_row = Row::new(contents, String::new());
+        EditorRows::render_row(&mut new_row);
+        self.row_contents.insert(at, new_row);
     }
 }
 
